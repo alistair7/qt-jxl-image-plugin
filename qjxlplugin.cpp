@@ -5,10 +5,11 @@
 
 class QJxlPlugin : public QImageIOPlugin
 {
+    Q_OBJECT
     Q_PLUGIN_METADATA(IID QImageIOHandlerFactoryInterface_iid FILE "qt-jxl-image-plugin.json")
 
 public:
-    QJxlPlugin(QObject *parent);
+    QJxlPlugin(QObject *parent = nullptr);
     Capabilities capabilities(QIODevice *device, const QByteArray &format) const override;
     QImageIOHandler *create(QIODevice *device, const QByteArray &format = QByteArray()) const override;
 };
@@ -41,3 +42,4 @@ QImageIOHandler *QJxlPlugin::create(QIODevice *device, const QByteArray &format)
     return nullptr;
 }
 
+#include "qjxlplugin.moc"

@@ -18,9 +18,6 @@
 #define QJXLHANDLER_USE_ICC
 #endif
 
-// Uncomment to use quantum depth of 16 bits per channel instead of 8
-//#define QJXLHANDLER_16BIT
-
 
 QJxlHandler::QJxlHandler() :
     QImageIOHandler(),
@@ -123,42 +120,6 @@ bool QJxlHandler::read(QImage* destImage)
     // Buffer whole JXL file.  TODO: Don't.
     QByteArray fileData = device()->readAll();
 
-    /* If I'm interpreting the docs right...
-     *
-     *  - JXL_*_ENDIAN has no influence on channel order - just byte order within 16/32-bit samples.
-     *  - Asking libjxl for 4 channels currently means RGBA, but the API looks like it will change in this area.
-     *  - QtImage::Format_ARGB32 expects channels in an endian-dependent order.  (So (uint32_t)0xFF00FFFF always produces cyan but (char*)"\xFF\x00\xFF\xFF" may not)
-     *  - QtImage::Format_RGBA8888 expects RGBA bytes in that order regardless of endianness.
-     *  - QtImage::Format_RGBA64 expects RGBA in that order, but byte order within each 16-bit sample is endian-dependent.
-     *
-     * Hence...
-     *
-     *   (JXL_TYPE_UINT8,  *)                 <-> QtImage::Format_RGBA8888
-     *   (JXL_TYPE_UINT16, JXL_NATIVE_ENDIAN) <-> QtImage::Format_RGBA64
-     *
-     * ...and if you want anything else you have to do platform-specific byte shuffling.
-     */
-
-    JxlPixelFormat pixelFormat = {.num_channels = 4, // 3 colors + alpha
-#ifdef QJXLHANDLER_16BIT
-                                  .data_type = JXL_TYPE_UINT16,
-#else
-                                  .data_type = JXL_TYPE_UINT8,
-#endif
-                                  .endianness = JXL_NATIVE_ENDIAN, // doesn't affect channel order, just order of 16/32-bit samples
-                                  .align = 0
-                                 };
-    
-#ifdef QJXLHANDLER_16BIT
-    QImage::Format qtPixelFormat = QImage::Format_RGBA64;
-    const unsigned bytesPerSample = 2;
-#else
-    QImage::Format qtPixelFormat = QImage::Format_RGBA8888;
-    const unsigned bytesPerSample = 1;
-#endif
-    
-    // Can alternatively ask libjxl for the default, but it likes to use float, which QImage doesn't support:
-    //JxlDecoderStatus res = JxlDecoderDefaultPixelFormat(dec.get(), &pixelFormat);
 
 
     // Decoding will pause on interesting events
@@ -175,17 +136,43 @@ bool QJxlHandler::read(QImage* destImage)
         return false;
     }
     
+
+    /* If I'm interpreting the docs right...
+     *
+     *  - JXL_*_ENDIAN has no influence on channel order - just byte order within 16/32-bit samples.
+     *  - Asking libjxl for 4 channels currently means RGBA, but the API looks like it will change in this area.
+     *  - QtImage::Format_ARGB32 expects channels in an endian-dependent order.  (So (uint32_t)0xFF00FFFF always produces cyan but (char*)"\xFF\x00\xFF\xFF" may not)
+     *  - QtImage::Format_RGBA8888 expects RGBA bytes in that order regardless of endianness.
+     *  - QtImage::Format_RGBA64 expects RGBA in that order, but byte order within each 16-bit sample is endian-dependent.
+     *
+     * Hence...
+     *
+     *   (JXL_TYPE_UINT8,  *)                 <-> QtImage::Format_RGBA8888
+     *   (JXL_TYPE_UINT16, JXL_NATIVE_ENDIAN) <-> QtImage::Format_RGBA64
+     *
+     * ...and if you want anything else you have to do platform-specific byte shuffling.
+     */
+
+
+    // Can alternatively ask libjxl for the default, but it likes to use float, which QImage doesn't support:
+    //JxlDecoderStatus res = JxlDecoderDefaultPixelFormat(dec.get(), &pixelFormat);
+
+    JxlPixelFormat pixelFormat = { .num_channels = 4, // 3 colors + alpha
+                                   .data_type = JXL_TYPE_UINT8,
+                                   .endianness = JXL_NATIVE_ENDIAN, // doesn't affect channel order, just order of 16/32-bit samples
+                                   .align = 0
+                                 };
+    JxlBasicInfo basicInfo;
+    QImage::Format qtPixelFormat = QImage::Format_RGBA8888;
+    unsigned bytesPerSample = 1;
+    std::unique_ptr<uint8_t[]> pixels; // Decoded pixel data
+    JxlDecoderStatus res;
+
     // Feed the decoder with bytes from the device
     size_t avail_in = fileData.size();
     const uint8_t *next_in = (uint8_t*)fileData.constData();
     
-    JxlBasicInfo basicInfo;
-    std::unique_ptr<uint8_t[]> pixels; // Decoded pixel data
-    JxlDecoderStatus res;
 
-    qDebug("Decoding jxl; threads=%zu channels=%u depth=%db use_icc=%s",
-           nThreads, pixelFormat.num_channels, qtPixelFormat==QImage::Format_RGBA64 ? 16 : 8, (events_wanted&JXL_DEC_COLOR_ENCODING) ? "yes" : "no");
-    
     // Start decoding, handling interesting events along the way
     while((res = JxlDecoderProcessInput(dec.get(), &next_in, &avail_in)) != JXL_DEC_SUCCESS)
     {
@@ -199,6 +186,19 @@ bool QJxlHandler::read(QImage* destImage)
                 qWarning("Failed in JxlDecoderGetBasicInfo");
                 return false;
             }
+            if(basicInfo.have_animation)
+            {
+                qWarning("Input is an animation, which we can't yet handle");
+            }
+
+            // If metadata indicates > 8-bit depth, switch to 16-bit
+            if(basicInfo.bits_per_sample > 8)
+            {
+                pixelFormat.data_type = JXL_TYPE_UINT16;
+                bytesPerSample = 2;
+                qtPixelFormat = QImage::Format_RGBA64;
+            }
+
             break;
 
 
@@ -291,7 +291,7 @@ bool QJxlHandler::read(QImage* destImage)
     // Tell the QImage the colorspace of the pixels
     if(!icc_profile.isEmpty())
     {
-        QColorSpace cs = QColorSpace::fromIccProfile(QByteArray((const char*)icc_profile.data(), icc_profile.size()));
+        QColorSpace cs = QColorSpace::fromIccProfile(QByteArray((const char*)icc_profile.constData(), icc_profile.size()));
         if(cs.isValid())
             destImage->setColorSpace(cs);
         else
