@@ -6,7 +6,7 @@
 
 ### Non-Features ###
 * No support for writing.
-* No support for animations (may be possible to view the last frame, but untested).
+* No support for animations (the last frame is returned as a static image).
 * Ambiguous support for CMYK(A) colorspaces.  I _think_ the decoder will handle them by converting to RGBA, but this is untested, and the libjxl API is unfinished in this area.
 
 ### Disclaimers ###

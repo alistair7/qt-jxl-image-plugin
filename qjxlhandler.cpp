@@ -6,6 +6,7 @@
 #include <QtCore/QVariant>
 #include <QtCore/QSize>
 #include <QtGui/QImage>
+#include <QTransform>
 
 #include <jxl/decode_cxx.h>
 #include <jxl/thread_parallel_runner_cxx.h>
@@ -17,6 +18,14 @@
 #include <QtGui/QColorSpace>
 #define QJXLHANDLER_USE_ICC
 #endif
+
+#ifdef __GNUC__
+#define QJXLHANDLER_FALLTHROUGH __attribute__ ((fallthrough));
+#else
+#define QJXLHANDLER_FALLTHROUGH
+#endif
+
+
 
 
 QJxlHandler::QJxlHandler() :
@@ -151,6 +160,8 @@ bool QJxlHandler::read(QImage* destImage)
      *   (JXL_TYPE_UINT16, JXL_NATIVE_ENDIAN) <-> QtImage::Format_RGBA64
      *
      * ...and if you want anything else you have to do platform-specific byte shuffling.
+     *
+     * Also note, "Gwenview can only apply color profile on RGB32 or ARGB32 images" - so might be worth calling QImage.convertTo(ARGB32) if we have a profile.
      */
 
 
@@ -212,7 +223,7 @@ bool QJxlHandler::read(QImage* destImage)
                 continue;
             }
             icc_profile.resize(icc_size);
-            if (JxlDecoderGetColorAsICCProfile(dec.get(), &pixelFormat, JXL_COLOR_PROFILE_TARGET_DATA, (uchar*)icc_profile.data(), icc_profile.size()) != JXL_DEC_SUCCESS)
+            if (JxlDecoderGetColorAsICCProfile(dec.get(), &pixelFormat, JXL_COLOR_PROFILE_TARGET_DATA, (uint8_t*)icc_profile.data(), icc_profile.size()) != JXL_DEC_SUCCESS)
             {
                 qWarning("Failed in JxlDecoderGetColorAsICCProfile");
                 icc_profile = "";
@@ -298,6 +309,46 @@ bool QJxlHandler::read(QImage* destImage)
             qWarning("Embedded colorspace unsupported; falling back on sRGB");
     }
 #endif
+
+    // Apply orientation transformation if required
+    // (Transcoded JPEGs all seem to have the flag set to IDENTITY, regardless of the origial JPEG's EXIF - not much we can do about that)
+    if(basicInfo.orientation != JXL_ORIENT_IDENTITY)
+    {
+        QTransform trans;
+        switch(basicInfo.orientation)
+        {
+        case JXL_ORIENT_TRANSPOSE:
+            trans.scale(-1, 1);
+            QJXLHANDLER_FALLTHROUGH
+        case JXL_ORIENT_ROTATE_90_CCW:
+            trans.rotate(90);
+            break;
+
+        case JXL_ORIENT_ROTATE_180:
+            trans.rotate(180);
+            break;
+
+        case JXL_ORIENT_ANTI_TRANSPOSE:
+            trans.scale(-1, 1);
+            QJXLHANDLER_FALLTHROUGH
+        case JXL_ORIENT_ROTATE_90_CW:
+            trans.rotate(270);
+            break;
+
+        case JXL_ORIENT_FLIP_HORIZONTAL:
+            trans.scale(-1, 1);
+            break;
+
+        case JXL_ORIENT_FLIP_VERTICAL:
+            trans.scale(1, -1);
+            break;
+
+        default:
+            qWarning("Unsupported orientation flag: %d", (int)basicInfo.orientation);
+        }
+
+        *destImage = destImage->transformed(trans);
+    }
 
     
     return true;
