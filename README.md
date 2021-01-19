@@ -2,12 +2,11 @@
 
 ### Features ###
 * Allows Qt applications to read single-image [JPEG XL](https://jpeg.org/jpegxl/index.html) files with depth of up to 16-bits per channel (wider gamuts will get silently converted to 16-bit by the decoder).
-* Supports all compression modes: lossy, lossless, and transcoded JPEG.
 
 ### Non-Features ###
 * No support for writing.
 * No support for animations (the last frame is returned as a static image).
-* Ambiguous support for CMYK(A) colorspaces.  I _think_ the decoder will handle them by converting to RGBA, but this is untested, and the libjxl API is unfinished in this area.
+* Ambiguous support for non-RGBA colorspaces.  I _think_ the decoder will handle them by converting to RGBA, but this is untested, and the libjxl API is unfinished in this area.
 
 ### Disclaimers ###
 This software is provided with no warranty.  libjxl is under heavy development, and breaking API changes are somewhat likely.
@@ -31,10 +30,10 @@ make
 Alternatively, open CMakeLists.txt in QtCreator and hit Build. Note, if you build in Debug configuration, you must have a Debug build of Qt in order to load it later.
 
 ### Install ###
-You need to install qt-jxl-image-plugin.so to a location where Qt can find it. This is system dependent and it won't be your normal library path.
+You need to install libqt-jxl-image-plugin.so to a location where Qt can find it. This is system dependent and it won't be your normal library path.
 
 Try
-`sudo install -m644 qt-jxl-image-plugin.so "$(qmake -query QT_INSTALL_PLUGINS)/imageformats"`
+`sudo install -m644 libqt-jxl-image-plugin.so "$(qmake -query QT_INSTALL_PLUGINS)/imageformats"`
 
 (For me this is /usr/lib/x86_64-linux-gnu/qt5/plugins/imageformats)
 
