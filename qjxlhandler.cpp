@@ -1,12 +1,10 @@
 /* qjxlhandler.cpp */
 
 #include <limits>
-#include <map>
 
 #include <QtCore/QVariant>
 #include <QtCore/QSize>
 #include <QtGui/QImage>
-#include <QTransform>
 
 #include <jxl/decode_cxx.h>
 #include <jxl/thread_parallel_runner_cxx.h>
@@ -47,19 +45,6 @@ struct QJxlState
     int nextFrame;                      // Next frame Qt wants (implicit or via jumpToImage or jumpToNextImage).
 
     QByteArray fileData;                // Buffered input file.
-};
-
-// Static map associating libjxl orientation codes with Qt equivalents.
-// TODO: Qt apparently ignores the orientation flag for animations.
-static const std::map<JxlOrientation, QImageIOHandler::Transformation> _jxlOrientationToQtTransform = {
-  {JXL_ORIENT_IDENTITY,        QImageIOHandler::TransformationNone},
-  {JXL_ORIENT_FLIP_HORIZONTAL, QImageIOHandler::TransformationMirror},
-  {JXL_ORIENT_ROTATE_180,      QImageIOHandler::TransformationRotate180},
-  {JXL_ORIENT_FLIP_VERTICAL,   QImageIOHandler::TransformationFlip},
-  {JXL_ORIENT_TRANSPOSE,       QImageIOHandler::TransformationFlipAndRotate90},
-  {JXL_ORIENT_ROTATE_90_CW,    QImageIOHandler::TransformationRotate90},
-  {JXL_ORIENT_ANTI_TRANSPOSE,  QImageIOHandler::TransformationMirrorAndRotate90},
-  {JXL_ORIENT_ROTATE_90_CCW,   QImageIOHandler::TransformationRotate270},
 };
 
 
@@ -271,8 +256,8 @@ int QJxlHandler::nextImageDelay() const
 QVariant QJxlHandler::option(ImageOption opt) const
 {
     if(_progress < HaveBasicInfo &&
-         (/*opt == ImageOption::Size || */opt == ImageOption::ImageTransformation
-          || opt == ImageOption::Animation)
+         (/*opt == ImageOption::Size || */
+          opt == ImageOption::Animation)
       )
     {
         qWarning("Unable to provide option %d before basic info is available", (int)opt);
@@ -283,8 +268,6 @@ QVariant QJxlHandler::option(ImageOption opt) const
     {
     /*case ImageOption::Size:
         return QSize(_state->basicInfo.xsize, _state->basicInfo.ysize);*/
-    case ImageOption::ImageTransformation:
-        return _jxlOrientationToQtTransform.at(_state->basicInfo.orientation);
     case ImageOption::Animation:
         return _state->basicInfo.have_animation;
     default:
@@ -606,7 +589,6 @@ bool QJxlHandler::supportsOption(ImageOption option) const
      * I could just peek an arbitrary amount into device until I get basicInfo... */
 
     return /*option == ImageOption::Size ||*/
-           option == ImageOption::ImageTransformation ||
            option == ImageOption::Animation;
 }
 
