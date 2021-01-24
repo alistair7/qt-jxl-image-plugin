@@ -1,7 +1,7 @@
 /* qjxlhandler.cpp */
 
 #include <limits>
-#include <memory>
+#include <map>
 
 #include <QtCore/QVariant>
 #include <QtCore/QSize>
@@ -19,6 +19,7 @@
 #define QJXLHANDLER_USE_ICC
 #endif
 
+// Suppress gcc switch fallthrough warnings
 #ifdef __GNUC__
 #define QJXLHANDLER_FALLTHROUGH __attribute__ ((fallthrough));
 #else
@@ -26,12 +27,136 @@
 #endif
 
 
+/* The libjxl *_cxx.h headers define functions so I can't include them in qjxlhandler.h without linker errors.
+ * So all the Jxl objects are defined in this source file. */
+struct QJxlState
+{
+    JxlDecoderPtr dec;                  // Main decoder context.
+    JxlThreadParallelRunnerPtr runner;  // (Just needs to exist.)
+    JxlBasicInfo basicInfo;             // File metadata.
+    JxlPixelFormat pixelFormat;         // Channel/depth info.
+    QByteArray iccProfile;              // ICC blob, if available.
+
+    std::unique_ptr<uint8_t[]> pixels;  // Single frame of decoded pixels.
+    size_t pixelsLength;                // Size of frame in bytes.
+
+    int currentImageNumber;             // Sequence no. of the last frame read() (0-indexed).
+    int imageCount;                     // Total frames.
+    int currentFrameDurationMs;         // Duration of current frame in milliseconds.
+    float msPerTick;                    // Duration of a "tick" in milliseconds.
+    int nextFrame;                      // Next frame Qt wants (implicit or via jumpToImage or jumpToNextImage).
+
+    QByteArray fileData;                // Buffered input file.
+    const uint8_t *next_in;             // Next byte for the decoder.
+    size_t avail_in;                    // Bytes left for the decoder.
+};
+
+// Static map associating libjxl orientation codes with Qt equivalents.
+// TODO: Qt apparently ignores the orientation flag for animations.
+static const std::map<JxlOrientation, QImageIOHandler::Transformation> _jxlOrientationToQtTransform = {
+  {JXL_ORIENT_IDENTITY,        QImageIOHandler::TransformationNone},
+  {JXL_ORIENT_FLIP_HORIZONTAL, QImageIOHandler::TransformationMirror},
+  {JXL_ORIENT_ROTATE_180,      QImageIOHandler::TransformationRotate180},
+  {JXL_ORIENT_FLIP_VERTICAL,   QImageIOHandler::TransformationFlip},
+  {JXL_ORIENT_TRANSPOSE,       QImageIOHandler::TransformationFlipAndRotate90},
+  {JXL_ORIENT_ROTATE_90_CW,    QImageIOHandler::TransformationRotate90},
+  {JXL_ORIENT_ANTI_TRANSPOSE,  QImageIOHandler::TransformationMirrorAndRotate90},
+  {JXL_ORIENT_ROTATE_90_CCW,   QImageIOHandler::TransformationRotate270},
+};
+
+
+inline static bool subscribeEvents(JxlDecoder *dec)
+{
+    const int events_wanted = JXL_DEC_BASIC_INFO | JXL_DEC_FRAME | JXL_DEC_FULL_IMAGE
+#ifdef QJXLHANDLER_USE_ICC
+                      | JXL_DEC_COLOR_ENCODING
+#endif
+    ;
+    if(JxlDecoderSubscribeEvents(dec, events_wanted) != JXL_DEC_SUCCESS)
+    {
+        qWarning("Failed in JxlDecoderSubscribeEvents");
+        return false;
+    }
+    return true;
+}
 
 
 QJxlHandler::QJxlHandler() :
     QImageIOHandler(),
-    _readStarted(false)
+    _state(nullptr),
+    _progress(Invalid)
 {
+    /* QImageIOHandler is sometimes instantiated and destroyed just to call canRead(),
+     * so don't work too hard in the constructor.  Decoder initialization is deferred until
+     * the application calls read(). */
+}
+
+
+void QJxlHandler::_init()
+{
+    if(_progress != Invalid)
+        return;
+
+    _state.reset(new QJxlState
+    {
+        .dec = JxlDecoderMake(nullptr),
+        .runner = JxlThreadParallelRunnerMake(nullptr, JxlThreadParallelRunnerDefaultNumWorkerThreads()),
+        // Default to 8-bit sampling.  Changes to 16-bit later if required.
+        .pixelFormat = {
+                          .num_channels = 4, // 3 colors + alpha
+                          .data_type = JXL_TYPE_UINT8,
+                          .endianness = JXL_NATIVE_ENDIAN,
+                          .align = 0
+                        },
+        .currentImageNumber = -1,
+        .imageCount = -1,
+        .nextFrame = 0,
+    });
+
+    if(_state == nullptr)         return (void)qWarning("Failed to create state object");
+    if(_state->dec == nullptr)    return (void)qWarning("Failed to create JxlDecoder");
+    if(_state->runner == nullptr) return (void)qWarning("Failed to create JxlThreadParallelRunner");
+
+    if(JxlDecoderSetParallelRunner(_state->dec.get(), JxlThreadParallelRunner, _state->runner.get()) != JXL_DEC_SUCCESS)
+        return (void)qWarning("Failed in JxlDecoderSetParallelRunner");
+
+    if(!subscribeEvents(_state->dec.get()))
+        return;
+
+    _progress = HaveState;
+}
+
+bool QJxlHandler::isInitialized() const
+{
+    return _progress > Invalid;
+}
+
+
+
+bool QJxlHandler::_rewind()
+{
+    JxlDecoderReset(_state->dec.get());
+
+    if(JxlDecoderSetParallelRunner(_state->dec.get(), JxlThreadParallelRunner, _state->runner.get()) != JXL_DEC_SUCCESS)
+    {
+        qWarning("Failed in JxlDecoderSetParallelRunner");
+        _state = nullptr;
+        return false;
+    }
+
+    if(!subscribeEvents(_state->dec.get()))
+    {
+        _state = nullptr;
+        return false;
+    }
+
+    _state->avail_in = _state->fileData.size();
+    _state->next_in = (const uint8_t*)_state->fileData.constData();
+    _state->currentFrameDurationMs = 0;
+    _state->currentImageNumber = -1;
+    //_state->imageCount  // Keep this populated
+    _state->nextFrame = 0; // TODO: don't want to reset this if we're wrapping around to find the requested frame
+    return true;
 }
 
 QJxlHandler::~QJxlHandler()
@@ -40,7 +165,10 @@ QJxlHandler::~QJxlHandler()
 
 bool QJxlHandler::canRead() const
 {
-    if (!device())
+    if(_progress >= HaveState && !_state->fileData.isEmpty())
+        return true;
+
+    if (!device() || !device()->isReadable())
         return false;
 
     QByteArray mimeFormat = getReadableFormat(*device());
@@ -54,97 +182,215 @@ bool QJxlHandler::canRead() const
 
 int QJxlHandler::currentImageNumber() const
 {
-    // Not doing animation atm
-    return _readStarted ? 0 : -1;
+    if(_progress < HaveBasicInfo)
+        qWarning("Request for current image number before we have basic info");
+
+    return _state->currentImageNumber;
 }
 
 QRect QJxlHandler::currentImageRect() const
 {
+    qWarning("currentImageRect is unsupported");
     return {};
 }
 
 int QJxlHandler::imageCount() const
 {
-    return 0;
+    // libjxl doesn't seem to provide this without us decoding every frame
+    if(_progress == Invalid || _state->imageCount == -1)
+    {
+        qWarning("Request for image count but we haven't counted them yet");
+        return 0;
+    }
+    return _state->imageCount;
+}
+
+bool QJxlHandler::jumpToImage(int imageNumber)
+{
+    if(_progress >= HaveBasicInfo && !_state->basicInfo.have_animation)
+    {
+        qWarning("Jumping to frame %d but this isn't an animation", imageNumber);
+        return false;
+    }
+    if(_state->imageCount > -1 && imageNumber >= _state->imageCount)
+    {
+        qWarning("Requested frame is out of range: %d", imageNumber);
+        return false;
+    }
+
+    _state->nextFrame = imageNumber;
+
+    if(imageNumber <= _state->currentImageNumber)
+    {
+        // To get a previous frame, have to start decoding from the beginning
+        _rewind();
+    }
+
+    return true;
+}
+
+bool QJxlHandler::jumpToNextImage()
+{
+    if(_progress >= HaveBasicInfo && !_state->basicInfo.have_animation)
+    {
+        qWarning("Jumping to next frame but this isn't an animation");
+        return false;
+    }
+
+    if(++_state->nextFrame == _state->imageCount)
+    {
+        qWarning("There is no next frame to jump to");
+        _state->nextFrame--;
+        return false;
+    }
+
+    return true;
 }
 
 int QJxlHandler::loopCount() const
 {
+    if(_progress < HaveBasicInfo)
+    {
+        qWarning("Request for loop count before we've read basicInfo structure");
+        return 0;
+    }
+
+    // Qt doesn't document an "infinity" option, so use INT_MAX
+    if(_state->basicInfo.have_animation)
+        return _state->basicInfo.animation.num_loops > 0 ? _state->basicInfo.animation.num_loops : std::numeric_limits<int>::max();
+
     return 0;
 }
 
 int QJxlHandler::nextImageDelay() const
 {
-    return 0;
+    return _state->basicInfo.have_animation ? _state->currentFrameDurationMs : 0;
 }
 
 QVariant QJxlHandler::option(ImageOption opt) const
 {
-    Q_UNUSED(opt);
-    return {};
+    if(_progress < HaveBasicInfo &&
+         (/*opt == ImageOption::Size || */opt == ImageOption::ImageTransformation
+          || opt == ImageOption::Animation)
+      )
+    {
+        qWarning("Unable to provide option %d before basic info is available", (int)opt);
+        return {};
+    }
+
+    switch(opt)
+    {
+    /*case ImageOption::Size:
+        return QSize(_state->basicInfo.xsize, _state->basicInfo.ysize);*/
+    case ImageOption::ImageTransformation:
+        return _jxlOrientationToQtTransform.at(_state->basicInfo.orientation);
+    case ImageOption::Animation:
+        return _state->basicInfo.have_animation;
+    default:
+        qWarning("Request for unsupported option %d", (int)opt);
+        return {};
+    }
 }
+
 
 bool QJxlHandler::read(QImage* destImage)
 {
-    if (!destImage) {
+    if (!destImage)
+    {
         qWarning("Destination QImage is null");
         return false;
     }
 
-    _readStarted = true;
+    if(_progress < HaveState)
+      _init();
 
-#ifdef EVERY_PIC_IS_A_SMALL_CYAN_SQUARE
-    uint32_t *pix = new uint32_t[10*10];
-    if(!pix)
+    // Run the decoder until we have frame index _state->nextFrame in _state->pixels
+    ReadUntil result = _readUntil(ReadUntil::NextFrameDecoded);
+    if(result != ReadUntil::NextFrameDecoded && result != ReadUntil::End)
     {
-        qWarning("Malloc failed");
-        return false;
-    }
-    for(int i=0; i<10*10; i++)
-        pix[i] = 0xFF00FFFF;
-
-    *destImage = QImage((uchar*)pix, 10, 10, 10*4, QImage::Format_ARGB32, [](void* img) { delete [] (uint32_t*)img; }, pix);
-    return true;
-#endif
-
-
-    JxlDecoderPtr dec = JxlDecoderMake(nullptr);
-    if(dec.get() == nullptr) {
-        qWarning("Failed to create JxlDecoder");
-        return false;
-    }
-    
-    // Tell decoder to use as many threads as it wants
-    size_t nThreads = JxlThreadParallelRunnerDefaultNumWorkerThreads();
-    JxlThreadParallelRunnerPtr runner = JxlThreadParallelRunnerMake(nullptr, nThreads);
-    if(runner.get() == nullptr) {
-        qWarning("Failed to create JxlThreadParallelRunner");
-        return false;
-    }
-    if(JxlDecoderSetParallelRunner(dec.get(), JxlThreadParallelRunner, runner.get()) != JXL_DEC_SUCCESS) {
-        qWarning("Failed in JxlDecoderSetParallelRunner");
+        qWarning("Failed to decode frame");
         return false;
     }
 
-    // Buffer whole JXL file.  TODO: Don't.
-    QByteArray fileData = device()->readAll();
+    if(result == ReadUntil::End)
+    {
+        // We hit EOF while trying to get the next frame.  Loop back to frame 0.
+        _rewind();
+        if(_readUntil(ReadUntil::NextFrameDecoded) != ReadUntil::NextFrameDecoded)
+        {
+            qWarning("Restarted decoding but failed to get frame 0");
+            _progress = Invalid;
+            return false;
+        }
+    }
 
 
+    unsigned bytesPerSample;
+    QImage::Format qtPixelFormat;
 
-    // Decoding will pause on interesting events
-    int events_wanted = JXL_DEC_BASIC_INFO | JXL_DEC_FULL_IMAGE;
+    if(_state->pixelFormat.data_type == JXL_TYPE_UINT8)
+    {
+        bytesPerSample = 1;
+        qtPixelFormat = QImage::Format_RGBA8888;
+    }
+    else if(_state->pixelFormat.data_type == JXL_TYPE_UINT16)
+    {
+        bytesPerSample = 2;
+        qtPixelFormat = QImage::Format_RGBA64;
+
+    }
+    else
+    {
+        qWarning("Pixel format isn't set correctly");
+        return false;
+    }
+
+    int stride = _state->basicInfo.xsize * _state->pixelFormat.num_channels * bytesPerSample;
+
+    // Create the image and transfer pixel ownership to Qt
+    auto pixelPtr = _state->pixels.release();
+    *destImage = QImage(pixelPtr, static_cast<int>(_state->basicInfo.xsize), static_cast<int>(_state->basicInfo.ysize),
+                        stride, qtPixelFormat, [](void* img) { delete [] (uint8_t*)img; }, pixelPtr);
 
 #ifdef QJXLHANDLER_USE_ICC
-    QByteArray icc_profile;
-    events_wanted |= JXL_DEC_COLOR_ENCODING;
+    // Tell the QImage the colorspace of the pixels
+    if(!_state->iccProfile.isEmpty())
+    {
+        QColorSpace cs = QColorSpace::fromIccProfile(QByteArray((const char*)_state->iccProfile.constData(), _state->iccProfile.size()));
+        if(cs.isValid())
+            destImage->setColorSpace(cs);
+        else
+            qWarning("Embedded colorspace unsupported; falling back on sRGB");
+    }
 #endif
 
-    if(JxlDecoderSubscribeEvents(dec.get(), events_wanted) != JXL_DEC_SUCCESS)
+    return true;
+}
+
+
+QJxlHandler::ReadUntil QJxlHandler::_readUntil(QJxlHandler::ReadUntil until)
+{
+
+    if(until == ReadUntil::BasicInfoAvailable && _progress >= HaveBasicInfo)
+        return ReadUntil::BasicInfoAvailable;
+
+    // Buffer whole JXL file.  TODO: Don't.
+    if(_state->fileData.isEmpty())
     {
-        qWarning("Failed in JxlDecoderSubscribeEvents");
-        return false;
+        if(device() == nullptr)
+        {
+            qWarning("Read attempted out of sequence - device is not set");
+            return ReadUntil::Error;
+        }
+        _state->fileData = device()->readAll();
+        _state->next_in = (uint8_t*)_state->fileData.constData();
+        _state->avail_in = _state->fileData.size();
     }
-    
+
+
+    JxlDecoderStatus res;
+    JxlDecoderStruct *dec = _state->dec.get();
+
 
     /* If I'm interpreting the docs right...
      *
@@ -168,65 +414,67 @@ bool QJxlHandler::read(QImage* destImage)
     // Can alternatively ask libjxl for the default, but it likes to use float, which QImage doesn't support:
     //JxlDecoderStatus res = JxlDecoderDefaultPixelFormat(dec.get(), &pixelFormat);
 
-    JxlPixelFormat pixelFormat = { .num_channels = 4, // 3 colors + alpha
-                                   .data_type = JXL_TYPE_UINT8,
-                                   .endianness = JXL_NATIVE_ENDIAN, // doesn't affect channel order, just order of 16/32-bit samples
-                                   .align = 0
-                                 };
-    JxlBasicInfo basicInfo;
-    QImage::Format qtPixelFormat = QImage::Format_RGBA8888;
-    unsigned bytesPerSample = 1;
-    std::unique_ptr<uint8_t[]> pixels; // Decoded pixel data
-    JxlDecoderStatus res;
-
-    // Feed the decoder with bytes from the device
-    size_t avail_in = fileData.size();
-    const uint8_t *next_in = (uint8_t*)fileData.constData();
-    
+    JxlDecoderStatus decoderStatus;
 
     // Start decoding, handling interesting events along the way
-    while((res = JxlDecoderProcessInput(dec.get(), &next_in, &avail_in)) != JXL_DEC_SUCCESS)
+    while((decoderStatus = JxlDecoderProcessInput(dec, &_state->next_in, &_state->avail_in)) != JXL_DEC_SUCCESS)
     {
       
-      switch(res)
+      switch(decoderStatus)
       {
-        case JXL_DEC_BASIC_INFO:
-            // Get image dimensions etc.
-            if(JxlDecoderGetBasicInfo(dec.get(), &basicInfo) != JXL_DEC_SUCCESS)
-            {
-                qWarning("Failed in JxlDecoderGetBasicInfo");
-                return false;
-            }
-            if(basicInfo.have_animation)
-            {
-                qWarning("Input is an animation, which we can't yet handle");
-            }
+      case JXL_DEC_BASIC_INFO:
+          if(_progress >= HaveBasicInfo)
+          {
+              // Cautiously discard any buffered pixels
+              _state->pixels = nullptr;
+          }
 
-            // If metadata indicates > 8-bit depth, switch to 16-bit
-            if(basicInfo.bits_per_sample > 8)
-            {
-                pixelFormat.data_type = JXL_TYPE_UINT16;
-                bytesPerSample = 2;
-                qtPixelFormat = QImage::Format_RGBA64;
-            }
+          // Get image dimensions etc.
+          if((res = JxlDecoderGetBasicInfo(dec, &_state->basicInfo)) != JXL_DEC_SUCCESS)
+          {
+              qWarning("Failed in JxlDecoderGetBasicInfo");
+              return ReadUntil::Error;
+          }
 
-            break;
+          // If metadata indicates > 8-bit depth, switch to 16-bit
+          if(_state->basicInfo.bits_per_sample > 8)
+          {
+              _state->pixelFormat.data_type = JXL_TYPE_UINT16;
+          }
+
+          _progress = HaveBasicInfo;
+
+          if(_state->basicInfo.have_animation)
+          {
+              _state->msPerTick = 1000 * _state->basicInfo.animation.tps_denominator / (float)_state->basicInfo.animation.tps_numerator;
+              // imageCount remains -1 because we have to count them as we go
+          }
+          else
+          {
+              _state->imageCount = 1;
+          }
+
+          if(until == ReadUntil::BasicInfoAvailable)
+              return ReadUntil::BasicInfoAvailable;
+
+          break;
 
 
 #ifdef QJXLHANDLER_USE_ICC
         case JXL_DEC_COLOR_ENCODING:
+
             // Get ICC color profile
             size_t icc_size;
-            if (JxlDecoderGetICCProfileSize(dec.get(), &pixelFormat, JXL_COLOR_PROFILE_TARGET_DATA, &icc_size) != JXL_DEC_SUCCESS)
+            if (JxlDecoderGetICCProfileSize(dec, &_state->pixelFormat, JXL_COLOR_PROFILE_TARGET_DATA, &icc_size) != JXL_DEC_SUCCESS)
             {
                 qWarning("Failed in JxlDecoderGetICCProfileSize");
                 continue;
             }
-            icc_profile.resize(icc_size);
-            if (JxlDecoderGetColorAsICCProfile(dec.get(), &pixelFormat, JXL_COLOR_PROFILE_TARGET_DATA, (uint8_t*)icc_profile.data(), icc_profile.size()) != JXL_DEC_SUCCESS)
+            _state->iccProfile.resize(icc_size);
+            if (JxlDecoderGetColorAsICCProfile(dec, &_state->pixelFormat, JXL_COLOR_PROFILE_TARGET_DATA, (uint8_t*)_state->iccProfile.data(), _state->iccProfile.size()) != JXL_DEC_SUCCESS)
             {
                 qWarning("Failed in JxlDecoderGetColorAsICCProfile");
-                icc_profile = "";
+                _state->iccProfile = "";
                 continue;
             }
 
@@ -234,155 +482,138 @@ bool QJxlHandler::read(QImage* destImage)
 #endif
 
         case JXL_DEC_NEED_IMAGE_OUT_BUFFER:
+
             // Time to allocate some space for the pixels
-            size_t bytes_required;
-            if (JxlDecoderImageOutBufferSize(dec.get(), &pixelFormat, &bytes_required) != JXL_DEC_SUCCESS )
+            if (JxlDecoderImageOutBufferSize(dec, &_state->pixelFormat, &_state->pixelsLength) != JXL_DEC_SUCCESS )
             {
                 qWarning("Failed in JxlDecoderImageOutBufferSize");
-                return false;
-            }
-            // Sanity check
-            if (bytes_required != (size_t)basicInfo.xsize * basicInfo.ysize * pixelFormat.num_channels * bytesPerSample)
-            {
-                qWarning("Pixel buffer size is %zu, but expected (%u * %u * %u * %u) = %zu",
-                         bytes_required, basicInfo.xsize, basicInfo.ysize, pixelFormat.num_channels, bytesPerSample,
-                         (size_t)basicInfo.xsize * basicInfo.ysize * pixelFormat.num_channels * bytesPerSample);
-                return false;
-            }
-            
-            pixels.reset(new uint8_t[bytes_required]);
-            if(pixels.get() == nullptr)
-            {
-                qWarning("Failed to allocate %zu B", bytes_required);
-                return false;
-            }
-            
-            if (JxlDecoderSetImageOutBuffer(dec.get(), &pixelFormat, pixels.get(), bytes_required) != JXL_DEC_SUCCESS)
-            {
-                qWarning("Failed in JxlDecoderSetImageOutBuffer");
-                return false;
+                return ReadUntil::Error;
             }
 
+            // Sanity check
+            if (_state->pixelsLength != (size_t)_state->basicInfo.xsize * _state->basicInfo.ysize * _state->pixelFormat.num_channels * (_state->pixelFormat.data_type == JXL_TYPE_UINT8 ? 1 : 2))
+            {
+                qWarning("Pixel buffer size is %zu, but expected (%u * %u * %u * %u) = %zu",
+                         _state->pixelsLength, _state->basicInfo.xsize, _state->basicInfo.ysize, _state->pixelFormat.num_channels, (_state->pixelFormat.data_type == JXL_TYPE_UINT8 ? 1 : 2),
+                         (size_t)_state->basicInfo.xsize * _state->basicInfo.ysize * _state->pixelFormat.num_channels * (_state->pixelFormat.data_type == JXL_TYPE_UINT8 ? 1 : 2));
+                return ReadUntil::Error;
+            }
+            
+            // Normally after a frame is decoded, we'll pass it to Qt and set pixels to nullptr.
+            // If we still own the data for whatever reason, keep the buffer we have and overwrite it.
+            if(_state->pixels.get() == nullptr)
+            {
+                _state->pixels.reset(new uint8_t[_state->pixelsLength]);
+                if(_state->pixels.get() == nullptr)
+                {
+                    qWarning("Failed to allocate %zu B", _state->pixelsLength);
+                    return ReadUntil::Error;
+                }
+            }
+            else
+            {
+                qWarning("Overwriting previously buffered pixels");
+            }
+            
+            if (JxlDecoderSetImageOutBuffer(dec, &_state->pixelFormat, _state->pixels.get(), _state->pixelsLength) != JXL_DEC_SUCCESS)
+            {
+                qWarning("Failed in JxlDecoderSetImageOutBuffer");
+                return ReadUntil::Error;
+            }
+            break;
+
+        case JXL_DEC_FRAME:
+            // Start of frame - can extract duration etc.
+            if(_state->basicInfo.have_animation)
+            {
+                JxlFrameHeader frameHeader;
+                if(JxlDecoderGetFrameHeader(dec, &frameHeader) != JXL_DEC_SUCCESS)
+                {
+                    qWarning("Failed in JxlDecoderGetFrameHeader");
+                    return ReadUntil::Error;
+                }
+
+                _state->currentFrameDurationMs = (int)(_state->msPerTick * frameHeader.duration);
+
+                //if(frameHeader.is_last) // This flag is NEVER set :(
+                //    qDebug("This is the last frame; counted %d in total", _state->currentImageNumber+1);
+
+            }
+            break;
+
         case JXL_DEC_FULL_IMAGE:
-            // If the file contains multiple images (e.g. an animation), we'll hit this multiple times.
-            // We'll also waste time decoding each one until we're left with the last frame.
+            // End of frame
+
+            _state->currentImageNumber ++;
+
+            if(until == ReadUntil::NextFrameDecoded)
+            {
+                if(_state->nextFrame == _state->currentImageNumber)
+                {
+                    _state->nextFrame++;
+                    return ReadUntil::NextFrameDecoded;
+                }
+
+                // If the frame we just decoded wasn't the next requested one (e.g. if jumpToImage() has been used), then ignore it and keep going.
+
+            }
             break;
 
         case JXL_DEC_NEED_MORE_INPUT:
-            if(avail_in == 0) {
+            if(_state->avail_in == 0)
+            {
                 // No more data to be had
                 qWarning("Input truncated");
-                return false;
+                return ReadUntil::Error;
             }
             continue;
 
         case JXL_DEC_ERROR:
             qWarning("Error while decoding");
-            return false;
+            return ReadUntil::Error;
 
         //case JXL_DEC_EXTENSIONS:
         //case JXL_DEC_PREVIEW_IMAGE:
         //case JXL_DEC_DC_IMAGE:
         default:
             qWarning("Unexpected result from JxlDecoderProcessInput");
-            return false;
+            return ReadUntil::Error;
             
       }
+
     }
     
-
-    int stride = basicInfo.xsize * pixelFormat.num_channels * bytesPerSample;
-
-    // Create the image and transfer pixel ownership to Qt
-    auto pixelPtr = pixels.release();
-    *destImage = QImage(pixelPtr, static_cast<int>(basicInfo.xsize), static_cast<int>(basicInfo.ysize),
-                        stride, qtPixelFormat, [](void* img) { delete [] (uint8_t*)img; }, pixelPtr);
-
-#ifdef QJXLHANDLER_USE_ICC
-    // Tell the QImage the colorspace of the pixels
-    if(!icc_profile.isEmpty())
-    {
-        QColorSpace cs = QColorSpace::fromIccProfile(QByteArray((const char*)icc_profile.constData(), icc_profile.size()));
-        if(cs.isValid())
-            destImage->setColorSpace(cs);
-        else
-            qWarning("Embedded colorspace unsupported; falling back on sRGB");
-    }
-#endif
-
-    // Apply orientation transformation if required
-    // (Transcoded JPEGs all seem to have the flag set to IDENTITY, regardless of the origial JPEG's EXIF - not much we can do about that)
-    if(basicInfo.orientation != JXL_ORIENT_IDENTITY)
-    {
-        QTransform trans;
-        switch(basicInfo.orientation)
-        {
-        case JXL_ORIENT_TRANSPOSE:
-            trans.scale(-1, 1);
-            QJXLHANDLER_FALLTHROUGH
-        case JXL_ORIENT_ROTATE_90_CCW:
-            trans.rotate(90);
-            break;
-
-        case JXL_ORIENT_ROTATE_180:
-            trans.rotate(180);
-            break;
-
-        case JXL_ORIENT_ANTI_TRANSPOSE:
-            trans.scale(-1, 1);
-            QJXLHANDLER_FALLTHROUGH
-        case JXL_ORIENT_ROTATE_90_CW:
-            trans.rotate(270);
-            break;
-
-        case JXL_ORIENT_FLIP_HORIZONTAL:
-            trans.scale(-1, 1);
-            break;
-
-        case JXL_ORIENT_FLIP_VERTICAL:
-            trans.scale(1, -1);
-            break;
-
-        default:
-            qWarning("Unsupported orientation flag: %d", (int)basicInfo.orientation);
-        }
-
-        *destImage = destImage->transformed(trans);
-    }
-
-    
-    return true;
+    // If we reach here, we've already returned all frames but Qt still wants the next frame.
+    return ReadUntil::End;
 }
 
 
 
 void QJxlHandler::setOption(ImageOption opt, const QVariant& value)
 {
-    Q_UNUSED(opt)
     Q_UNUSED(value)
-    return;
+    qWarning("Caller tried to set unsupported option %d", (int)opt);
 }
 
 bool QJxlHandler::supportsOption(ImageOption option) const
 {
-    switch(option)
-    {
-    case ImageFormat:
-    case Size:
-        // maybe one day
-    default:
-        return false;
-    }
+    /* Supporting Size seems like a good idea, but I don't know how I'm supposed
+     * to determine it before Qt requests it.  canRead() isn't supposed
+     * to change the device state, and read() is too late...
+     * I could just peek an arbitrary amount into device until I get basicInfo... */
+
+    return /*option == ImageOption::Size ||*/
+           option == ImageOption::ImageTransformation ||
+           option == ImageOption::Animation;
 }
 
 
 
 QByteArray QJxlHandler::getReadableFormat(QIODevice& device)
 {
-    // TODO: Maybe return different formats if it's e.g. an image sequence.
-
-    QByteArray header = device.peek(12);
-    if(header.size() != 12)
+    const int signatureBytes = 12;
+    QByteArray header = device.peek(signatureBytes);
+    if(header.size() != signatureBytes)
     {
         qInfo("Only got %dB from peek", header.size());
         return {};

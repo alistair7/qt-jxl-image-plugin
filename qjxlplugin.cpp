@@ -25,7 +25,7 @@ QImageIOPlugin::Capabilities QJxlPlugin::capabilities(QIODevice *device, const Q
     if(device == nullptr)
         return (format == "jxl") ? QImageIOPlugin::CanRead : Capabilities{};
 
-    return QJxlHandler::getReadableFormat(*device) == "jxl" ?
+    return device->isReadable() && QJxlHandler::getReadableFormat(*device) == "jxl" ?
                 QImageIOPlugin::CanRead :
                 Capabilities{};
 }

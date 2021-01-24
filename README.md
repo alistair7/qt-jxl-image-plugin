@@ -1,11 +1,11 @@
 ## JPEG XL Image Format Plugin for Qt ##
 
 ### Features ###
-* Allows Qt applications to read single-image [JPEG XL](https://jpeg.org/jpegxl/index.html) files with depth of up to 16-bits per channel (wider gamuts will get silently converted to 16-bit by the decoder).
+Allows Qt applications to read [JPEG XL](https://jpeg.org/jpegxl/index.html) files with depth of up to 16-bits per channel (wider gamuts will get silently converted to 16-bit by the decoder).
 
 ### Non-Features ###
 * No support for writing.
-* No support for animations (the last frame is returned as a static image).
+* Preliminary support for animations, but they doesn't always work (cjxl can produce animated JXLs that djxl can't decode...).
 * Ambiguous support for non-RGBA colorspaces.  I _think_ the decoder will handle them by converting to RGBA, but this is untested, and the libjxl API is unfinished in this area.
 
 ### Disclaimers ###
