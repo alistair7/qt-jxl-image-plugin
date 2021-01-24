@@ -47,8 +47,6 @@ struct QJxlState
     int nextFrame;                      // Next frame Qt wants (implicit or via jumpToImage or jumpToNextImage).
 
     QByteArray fileData;                // Buffered input file.
-    const uint8_t *next_in;             // Next byte for the decoder.
-    size_t avail_in;                    // Bytes left for the decoder.
 };
 
 // Static map associating libjxl orientation codes with Qt equivalents.
@@ -150,8 +148,11 @@ bool QJxlHandler::_rewind()
         return false;
     }
 
-    _state->avail_in = _state->fileData.size();
-    _state->next_in = (const uint8_t*)_state->fileData.constData();
+    if(JxlDecoderSetInput(_state->dec.get(), (const uint8_t*)_state->fileData.constData(), _state->fileData.size()) != JXL_DEC_SUCCESS)
+    {
+      qWarning("Failed in JxlDecoderSetInput");
+      return false;
+    }
     _state->currentFrameDurationMs = 0;
     _state->currentImageNumber = -1;
     //_state->imageCount  // Keep this populated
@@ -374,6 +375,9 @@ QJxlHandler::ReadUntil QJxlHandler::_readUntil(QJxlHandler::ReadUntil until)
     if(until == ReadUntil::BasicInfoAvailable && _progress >= HaveBasicInfo)
         return ReadUntil::BasicInfoAvailable;
 
+    JxlDecoderStatus res;
+    JxlDecoderStruct *dec = _state->dec.get();
+
     // Buffer whole JXL file.  TODO: Don't.
     if(_state->fileData.isEmpty())
     {
@@ -383,13 +387,17 @@ QJxlHandler::ReadUntil QJxlHandler::_readUntil(QJxlHandler::ReadUntil until)
             return ReadUntil::Error;
         }
         _state->fileData = device()->readAll();
-        _state->next_in = (uint8_t*)_state->fileData.constData();
-        _state->avail_in = _state->fileData.size();
+
+        if(JxlDecoderSetInput(dec, (const uint8_t*)_state->fileData.constData(), _state->fileData.size()) != JXL_DEC_SUCCESS)
+        {
+            qWarning("Failed in JxlDecoderSetInput");
+            return ReadUntil::Error;
+        }
+
+
     }
 
 
-    JxlDecoderStatus res;
-    JxlDecoderStruct *dec = _state->dec.get();
 
 
     /* If I'm interpreting the docs right...
@@ -417,7 +425,7 @@ QJxlHandler::ReadUntil QJxlHandler::_readUntil(QJxlHandler::ReadUntil until)
     JxlDecoderStatus decoderStatus;
 
     // Start decoding, handling interesting events along the way
-    while((decoderStatus = JxlDecoderProcessInput(dec, &_state->next_in, &_state->avail_in)) != JXL_DEC_SUCCESS)
+    while((decoderStatus = JxlDecoderProcessInput(dec)) != JXL_DEC_SUCCESS)
     {
       
       switch(decoderStatus)
@@ -560,13 +568,8 @@ QJxlHandler::ReadUntil QJxlHandler::_readUntil(QJxlHandler::ReadUntil until)
             break;
 
         case JXL_DEC_NEED_MORE_INPUT:
-            if(_state->avail_in == 0)
-            {
-                // No more data to be had
-                qWarning("Input truncated");
-                return ReadUntil::Error;
-            }
-            continue;
+            qWarning("Input truncated");
+            return ReadUntil::Error;
 
         case JXL_DEC_ERROR:
             qWarning("Error while decoding");
