@@ -1,11 +1,15 @@
 ## JPEG XL Image Format Plugin for Qt ##
 
-### This is not the plugin you are looking for ###
-After writing this plugin I discovered that novomesk has written one which is superior in practically every way, and you should probably use that one instead:
+<br><br><br>
 
-https://github.com/novomesk/qt-jpegxl-image-plugin
+-----
+<br><br>
+## This plugin is no longer maintained ##
+Try [novomesk/qt-jpegxl-image-plugin](https://github.com/novomesk/qt-jpegxl-image-plugin) instead.
+<br><br><br>
 
-The only possible advantage to mine is that it uses less memory for images with 8-bit color depth or less.  I'll keep maintaining it for the time being, but I'm unlikely to do much beyond keeping up with libjxl API changes.
+-----
+<br><br><br>
 
 ### Features ###
 Allows Qt applications to read [JPEG XL](https://jpeg.org/jpegxl/index.html) files with depth of up to 16-bits per channel (wider gamuts will get silently converted to 16-bit by the decoder).
